@@ -1,0 +1,66 @@
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+
+class PrivacyAuditor:
+
+    def __init__(self, real_df, synthetic_df):
+        # Use only numerical columns
+        self.real = real_df.select_dtypes(include=[np.number])
+        self.synthetic = synthetic_df.select_dtypes(include=[np.number])
+
+    
+    # 1. Distance to Closest Record (DCR)
+    
+    def compute_dcr(self):
+        nn = NearestNeighbors(n_neighbors=1)
+        nn.fit(self.real)
+
+        distances, _ = nn.kneighbors(self.synthetic)
+
+        return {
+            "mean_dcr": float(np.mean(distances)),
+            "min_dcr": float(np.min(distances))
+        }
+
+    
+    # 2. NNDR (Nearest Neighbor Distance Ratio)
+    
+    def compute_nndr(self):
+        nn = NearestNeighbors(n_neighbors=2)
+        nn.fit(self.real)
+
+        distances, _ = nn.kneighbors(self.synthetic)
+        d1 = distances[:, 0]
+        d2 = distances[:, 1]
+
+        ratio = d1 / (d2 + 1e-8)
+
+        return {
+            "mean_nndr": float(np.mean(ratio)),
+            "min_nndr": float(np.min(ratio))
+        }
+    
+    def membership_inference_attack(self):
+        real = self.real.copy()
+        synth = self.synthetic.copy()
+
+        real["label"] = 1   # member
+        synth["label"] = 0  # non-member
+ 
+        combined = np.vstack([real.values, synth.values])
+        labels = np.concatenate([real["label"].values, synth["label"].values])
+
+        X_train, X_test, y_train, y_test = train_test_split(
+        combined, labels, test_size=0.3, random_state=42)
+
+        model = RandomForestClassifier()
+        model.fit(X_train, y_train)
+
+        preds = model.predict(X_test)
+        acc = accuracy_score(y_test, preds)
+
+        return acc
