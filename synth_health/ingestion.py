@@ -1,11 +1,12 @@
 import pandas as pd
 from sklearn.impute import KNNImputer
 import numpy as np
+LOG_TRANSFORM_COLS = ['albumin_creatinine_ratio']
+
+rounded_arrays = {}
+
 
 class DataIngestion:
-    LOG_TRANSFORM_COLS = ['serum_creatinine', 'urine_albumin', 'albumin_creatinine_ratio',
-                      'blood_urea_nitrogen', 'uric_acid']
-    
     def __init__(self, file_path):
         self.file_path = file_path
         self.df = None
@@ -56,6 +57,7 @@ class DataIngestion:
         amount_of_rounded_values = [val for val in amount_of_rounded_values if val <= 2] 
         if col in mode_col:
             amount_of_rounded_values = [1]
+        rounded_arrays[col] = amount_of_rounded_values
         #print(col,amount_of_rounded_values)
         self.df[col] = [
         round(val, np.random.choice(amount_of_rounded_values)) 
@@ -71,19 +73,24 @@ class DataIngestion:
 
         imputer = KNNImputer(n_neighbors=20, weights="distance")
         self.df[num_col] = imputer.fit_transform(self.df[num_col])
-        self.df[num_col] = self.df[num_col]
-        rounded_to_1 = ['albumin_serum','phosphorus','calcium']
 
+        rounded_to_1 = ['albumin_serum','phosphorus','calcium']
         for col in num_col:
             self.rounding(col, rounded_to_1)
-        if 'ckd_stage' in self.df.columns:
-            mask = self.df['ckd_stage'].astype(str).str.lower() == 'unknown'
-            self.df.loc[mask, 'egfr'] = pd.NA
-        """for col in self.LOG_TRANSFORM_COLS:
+
+        if 'albumin_creatinine_ratio' in self.df.columns:
+            self.df['albumin_creatinine_ratio'] = np.log1p(self.df['albumin_creatinine_ratio'])
+
+        for col in LOG_TRANSFORM_COLS:
             if col in self.df.columns:
-                self.df[col] = np.log1p(self.df[col])"""
-        if 'age' in self.df.columns:
-            self.df['age'] = self.df['age'].clip(lower=1)
+                self.df[col] = np.log1p(self.df[col])
+
+        self.df['age'] = self.df['age'].clip(lower=1)
+
+        """cols_to_fix = ['serum_creatinine']
+        for col in cols_to_fix:
+            self.df[col] = self.df[col].clip(upper=self.df[col].quantile(0.99))"""
+        
 
     def get_basic_stats(self):
         """Return basic statistics"""
