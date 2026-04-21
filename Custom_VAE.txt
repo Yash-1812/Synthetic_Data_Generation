@@ -1,0 +1,255 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.optim.adam import Adam
+from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn import preprocessing
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, LabelEncoder
+
+STRING_CAT_COLS = ['ethnicity', 'gender', 'ckd_stage']
+NUMBER_CAT_COLS = ['education_level', 'ever_smoked', 'diabetes_diagnosed', 'insulin_use', 'diabetes_pills', 'current_smoker', 'ckd_present']
+# Define batchsize and input dimensions
+epochs = 300
+batch_size = 500
+compress_dims = (512, 512)
+decompress_dims = (512, 512)
+input_dim = 57
+latent_dim = 128
+weight_decay = 3e-4
+val_split = 0.1
+BETA = 1
+lr = 1e-5
+
+class preprocessor:
+    def __init__(self, df, schema):
+        self.df = df
+        self.schema = schema
+        self.num_cols = [col for col in schema if schema[col] == "numerical"]
+        self.cat_cols = [col for col in schema if schema[col] == "categorical"]
+        self.num_scaler = None
+        self.cat_scaler = None
+        self.str_n_classes = {}
+        self.cat_dims = []
+
+    def fit(self):
+        """Fit the preprocessor to the data"""
+        self.str_cat_cols = [c for c in self.cat_cols if c in STRING_CAT_COLS]
+        self.num_cat_cols = [c for c in self.cat_cols if c in NUMBER_CAT_COLS]
+        self.num_scaler = MinMaxScaler()
+        #self.cat_scaler = OneHotEncoder(sparse=False, handle_unknown='ignore')
+        
+
+        if self.num_cols:
+            self.num_scaler.fit(self.df[self.num_cols].fillna(0))
+        if self.str_cat_cols:
+            self.cat_scaler.fit(self.df[self.str_cat_cols].fillna('Unknown'))
+        if self.num_cat_cols:
+            self.cat_scaler.fit(self.df[self.num_cat_cols].fillna(-1))
+
+
+        for col in self.str_cat_cols:
+            le = LabelEncoder()
+            le.fit(self.df[col])
+            self.str_encoders[col]  = le
+            self.str_n_classes[col] = len(le.classes_)
+            self.cat_dims.append(len(le.classes_))
+
+        
+        for col in self.num_cat_cols:
+            le = LabelEncoder()
+            le.fit(self.df[col])
+            self.num_cat_encoders[col]  = le
+            self.num_cat_n_classes[col] = len(le.classes_)
+            self.cat_dims.append(len(le.classes_))
+
+        
+        self.num_dim = len(self.num_cols)
+        self.input_dim = self.num_dim + sum(self.cat_dims)
+        return self
+
+    def transform(self, df):
+        parts = []   
+        if self.num_cat_cols:
+            parts.append(self.cat_scaler.transform(
+                df[self.num_cat_cols].fillna(-1)).astype(np.float32))
+
+
+        for col in self.str_cat_cols:
+            le    = self.str_encoders[col]
+            vals = df[col].astype(str)
+            vals  = vals.apply(lambda v: v if v in le.classes_ else 'Unknown')
+            codes = le.transform(vals)
+            n     = self.str_n_classes[col]
+            ohe   = np.zeros((len(df), n), dtype=np.float32)
+            ohe[np.arange(len(df)), codes] = 1.0
+            parts.append(ohe)
+
+
+        for col in self.num_cat_cols:
+            le = self.num_cat_encoders[col]
+            vals = df[col].fillna(-1).astype(int) 
+            vals  = vals.apply(lambda v: v if v in le.classes_ else -1 )
+            codes = le.transform(vals)
+            n     = self.num_cat_n_classes[col]
+            ohe   = np.zeros((len(df), n), dtype=np.float32)
+            ohe[np.arange(len(df)), codes] = 1.0
+            parts.append(ohe)
+        return np.hstack(parts)
+    
+
+    def inverse_transform(self, data):
+        """
+        data: The numpy array output from the VAE (the synthetic data)"""
+        df = pd.DataFrame()
+        current_pos = 0
+
+        # 1. Reverse Numerical Continuous
+        if self.num_cols:
+            num_width = len(self.num_cols)
+            num_part = data[:, current_pos : current_pos + num_width]
+            # Reverse the MinMaxScaler
+            num_rev = self.num_scaler.inverse_transform(num_part)
+            df[self.num_cols] = num_rev
+            current_pos += num_width
+
+        # 2. Reverse String Categoricals
+        for col in self.str_cat_cols:
+            n = self.str_n_classes[col]
+            # Slice the chunk belonging to this column
+            ohe_part = data[:, current_pos : current_pos + n]
+            # Find the index of the highest value (the "1")
+            codes = np.argmax(ohe_part, axis=1)
+            # Use the stored LabelEncoder to get the original text back
+            df[col] = self.str_encoders[col].inverse_transform(codes)
+            current_pos += n
+
+        # 3. Reverse Numeric Categoricals
+        for col in self.num_cat_cols:
+            n = self.num_cat_n_classes[col]
+            # Slice the chunk
+            ohe_part = data[:, current_pos : current_pos + n]
+            # Find the "1"
+            codes = np.argmax(ohe_part, axis=1)
+            # Get the original numbers back
+            df[col] = self.num_cat_encoders[col].inverse_transform(codes)
+            current_pos += n
+
+        return df
+ 
+class CKDDataset(Dataset):
+    def __init__(self, tensor):
+        self.data = tensor
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+# Define Device as Cuda if available else CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class VAE(nn.Module):
+
+    def __init__(self, input_dim = input_dim,compress_dim = compress_dims, latent_dim= latent_dim, device=device):
+        super(VAE, self).__init__()
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, compress_dim[0]),
+            nn.LeakyReLU(0.2),
+            nn.Linear(compress_dim[0], compress_dim[1]),
+            nn.LeakyReLU(0.2)
+            )
+        
+        # Latent mean and variance 
+        self.mean_layer = nn.Linear(compress_dim[1], latent_dim)
+        self.logvar_layer = nn.Linear(compress_dim[1], latent_dim)
+        
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, compress_dim[1]),
+            nn.ReLU(),
+            nn.Linear(compress_dim[1], compress_dim[0]),
+            nn.ReLU(),
+            nn.Linear(compress_dim[0], input_dim)
+        )
+     
+    # Encode function
+    def encode(self, x):
+        x = self.encoder(x)
+        mean, log_var = self.mean_layer(x), self.logvar_layer(x)
+        return mean, log_var
+    
+    # Add Reparameterization
+    def reparameterization(self, mean, var):
+        epsilon = torch.randn_like(var).to(device)      
+        z = mean + var*epsilon
+        return z
+
+    # Decode function
+    def decode(self, x):
+        return self.decoder(x)
+
+    # Forward Function
+    def forward(self, x):
+        mean, log_var = self.encode(x)
+        z = self.reparameterization(mean, log_var)
+        x_hat = self.decode(z)
+        return x_hat, mean, log_var
+    
+    # Reconstruct input from compressed form
+    def reconstruction(self,mean, log_var):
+        z = self.reparameterization(mean, log_var)
+        x_hat = self.decode(z)
+        return x_hat
+    
+    @staticmethod
+    def loss_function(x, x_hat, mean, log_var, beta = BETA):
+    # Reproduction Loss
+        reproduction_loss = nn.functional.mse_loss(x_hat, x)
+        
+        # KL Divergence Loss
+        KLD = - 0.5 * torch.sum(1+ log_var - mean.pow(2) - log_var.exp())
+        return reproduction_loss + beta*KLD
+
+class VAESynthesizer:
+    def __init__(self, schema):
+        self.schema       = schema
+        self.model        = None
+        self.beta         = BETA
+        self._real_values = {}
+        self._ord_real    = {}
+        self._edu_freq    = None
+ 
+    def train(self,model, optimizer, epochs = epochs, device = device, df = None, val_split = 0.1):
+    # Set model to training mode
+        dataset = CKDDataset(torch.tensor(self.preprocessor.transform(df), dtype=torch.float32))
+        val_size = int(len(dataset) * val_split)
+        train_size = len(dataset) - val_size
+        train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        test_dataloader = DataLoader(val_dataset, batch_size=batch_size)
+
+        self.model = VAE.to(device)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+        # Loop for each epoch
+        for epoch in range(1, epochs+1):
+            self.model.train()
+            overall_loss = 0
+            # Iterate over the batches formed by DataLoader
+            for x in train_dataloader:
+                x = x.to(device)
+                
+                # Reset Gradient
+                optimizer.zero_grad()
+                x_hat, mean, log_var = model(x)
+                
+                # Calculate batch loss and then overall loss
+                loss = VAE.loss_function(x, x_hat, mean, log_var)
+                overall_loss += loss.item()
+                
+                # Backpropagate the loss and train the optimizer
+                loss.backward()
+                optimizer.step()
+
+            print("\tEpoch", epoch + 1, "\tAverage Loss: ")
+        return overall_loss
