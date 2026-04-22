@@ -14,7 +14,6 @@ epochs = 300
 batch_size = 500
 compress_dims = (512, 512)
 decompress_dims = (512, 512)
-input_dim = 57
 latent_dim = 128
 weight_decay = 3e-4
 val_split = 0.1
@@ -22,18 +21,22 @@ BETA = 1
 lr = 1e-5
 
 class preprocessor:
-    def __init__(self, df, schema):
-        self.df = df
+    def __init__(self, schema):
         self.schema = schema
         self.num_cols = [col for col in schema if schema[col] == "numerical"]
         self.cat_cols = [col for col in schema if schema[col] == "categorical"]
         self.num_scaler = None
-        self.cat_scaler = None
         self.str_n_classes = {}
         self.cat_dims = []
+        self.num_cat_n_classes = {}
+        self.str_encoders = {}
+        self.num_cat_encoders = {}
 
-    def fit(self):
+
+    def fit(self, df):
         """Fit the preprocessor to the data"""
+        self.df = df
+        self.col_order    = list(df.columns)
         self.str_cat_cols = [c for c in self.cat_cols if c in STRING_CAT_COLS]
         self.num_cat_cols = [c for c in self.cat_cols if c in NUMBER_CAT_COLS]
         self.num_scaler = MinMaxScaler()
@@ -42,11 +45,6 @@ class preprocessor:
 
         if self.num_cols:
             self.num_scaler.fit(self.df[self.num_cols].fillna(0))
-        if self.str_cat_cols:
-            self.cat_scaler.fit(self.df[self.str_cat_cols].fillna('Unknown'))
-        if self.num_cat_cols:
-            self.cat_scaler.fit(self.df[self.num_cat_cols].fillna(-1))
-
 
         for col in self.str_cat_cols:
             le = LabelEncoder()
@@ -58,7 +56,8 @@ class preprocessor:
         
         for col in self.num_cat_cols:
             le = LabelEncoder()
-            le.fit(self.df[col])
+            vals = self.df[col].fillna(-1).astype(int) 
+            le.fit(vals)
             self.num_cat_encoders[col]  = le
             self.num_cat_n_classes[col] = len(le.classes_)
             self.cat_dims.append(len(le.classes_))
@@ -70,14 +69,15 @@ class preprocessor:
 
     def transform(self, df):
         parts = []   
-        if self.num_cat_cols:
-            parts.append(self.cat_scaler.transform(
-                df[self.num_cat_cols].fillna(-1)).astype(np.float32))
+        if self.num_cols:
+            num_scaled = self.num_scaler.transform(df[self.num_cols].fillna(0)).astype(np.float32)
+            parts.append(num_scaled)
 
 
         for col in self.str_cat_cols:
             le    = self.str_encoders[col]
             vals = df[col].astype(str)
+            vals = df[col].fillna('Unknown').astype(str)
             vals  = vals.apply(lambda v: v if v in le.classes_ else 'Unknown')
             codes = le.transform(vals)
             n     = self.str_n_classes[col]
@@ -103,14 +103,15 @@ class preprocessor:
         data: The numpy array output from the VAE (the synthetic data)"""
         df = pd.DataFrame()
         current_pos = 0
-
+        rows = {}
         # 1. Reverse Numerical Continuous
         if self.num_cols:
             num_width = len(self.num_cols)
             num_part = data[:, current_pos : current_pos + num_width]
             # Reverse the MinMaxScaler
             num_rev = self.num_scaler.inverse_transform(num_part)
-            df[self.num_cols] = num_rev
+            for i, col in enumerate(self.num_cols):
+                rows[col] = num_rev[:, i]
             current_pos += num_width
 
         # 2. Reverse String Categoricals
@@ -121,7 +122,7 @@ class preprocessor:
             # Find the index of the highest value (the "1")
             codes = np.argmax(ohe_part, axis=1)
             # Use the stored LabelEncoder to get the original text back
-            df[col] = self.str_encoders[col].inverse_transform(codes)
+            rows[col] = self.str_encoders[col].inverse_transform(codes)
             current_pos += n
 
         # 3. Reverse Numeric Categoricals
@@ -132,10 +133,12 @@ class preprocessor:
             # Find the "1"
             codes = np.argmax(ohe_part, axis=1)
             # Get the original numbers back
-            df[col] = self.num_cat_encoders[col].inverse_transform(codes)
+            rows[col] = self.num_cat_encoders[col].inverse_transform(codes)
             current_pos += n
 
-        return df
+        out = pd.DataFrame({c: rows[c] for c in self.col_order if c in rows})
+
+        return out
  
 class CKDDataset(Dataset):
     def __init__(self, tensor):
@@ -150,7 +153,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class VAE(nn.Module):
 
-    def __init__(self, input_dim = input_dim,compress_dim = compress_dims, latent_dim= latent_dim, device=device):
+    def __init__(self, input_dim, compress_dim = compress_dims, latent_dim= latent_dim, device=device):
         super(VAE, self).__init__()
         # Encoder
         self.encoder = nn.Sequential(
@@ -180,9 +183,10 @@ class VAE(nn.Module):
         return mean, log_var
     
     # Add Reparameterization
-    def reparameterization(self, mean, var):
-        epsilon = torch.randn_like(var).to(device)      
-        z = mean + var*epsilon
+    def reparameterization(self, mean, var):     
+        std = torch.exp(0.5 * var)
+        epsilon = torch.randn_like(var).to(device)
+        z = mean + std * epsilon
         return z
 
     # Decode function
@@ -206,22 +210,23 @@ class VAE(nn.Module):
     def loss_function(x, x_hat, mean, log_var, beta = BETA):
     # Reproduction Loss
         reproduction_loss = nn.functional.mse_loss(x_hat, x)
-        
         # KL Divergence Loss
-        KLD = - 0.5 * torch.sum(1+ log_var - mean.pow(2) - log_var.exp())
+        KLD = - 0.5 * torch.mean(1+ log_var - mean.pow(2) - log_var.exp())
         return reproduction_loss + beta*KLD
 
 class VAESynthesizer:
     def __init__(self, schema):
-        self.schema       = schema
-        self.model        = None
-        self.beta         = BETA
+        self.schema = schema
+        self.model = None
+        self.beta = BETA
+        self.preprocessor = preprocessor(schema)
         self._real_values = {}
-        self._ord_real    = {}
-        self._edu_freq    = None
+        self._ord_real = {}
+        self._edu_freq = None
  
-    def train(self,model, optimizer, epochs = epochs, device = device, df = None, val_split = 0.1):
+    def train(self,df, epochs = epochs, device = device, val_split = 0.1):
     # Set model to training mode
+        self.preprocessor.fit(df)
         dataset = CKDDataset(torch.tensor(self.preprocessor.transform(df), dtype=torch.float32))
         val_size = int(len(dataset) * val_split)
         train_size = len(dataset) - val_size
@@ -229,8 +234,8 @@ class VAESynthesizer:
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         test_dataloader = DataLoader(val_dataset, batch_size=batch_size)
 
-        self.model = VAE.to(device)
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+        self.model = VAE(input_dim=self.preprocessor.input_dim).to(device)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         # Loop for each epoch
         for epoch in range(1, epochs+1):
             self.model.train()
@@ -241,7 +246,7 @@ class VAESynthesizer:
                 
                 # Reset Gradient
                 optimizer.zero_grad()
-                x_hat, mean, log_var = model(x)
+                x_hat, mean, log_var = self.model(x)
                 
                 # Calculate batch loss and then overall loss
                 loss = VAE.loss_function(x, x_hat, mean, log_var)
@@ -251,5 +256,19 @@ class VAESynthesizer:
                 loss.backward()
                 optimizer.step()
 
-            print("\tEpoch", epoch + 1, "\tAverage Loss: ")
+            print(f"\tEpoch {epoch}\tAverage Loss: {overall_loss / train_size:.6f}")
         return overall_loss
+    
+
+    def generate(self, num_samples):
+        if self.model is None:
+            raise RuntimeError("Call .train() first.")
+        self.model.eval()
+        with torch.no_grad():
+            # Sample from standard normal distribution
+            z = torch.randn(num_samples, latent_dim).to(device)
+            # Decode the sampled latent vectors to generate synthetic data
+            generated_data = self.model.decode(z)
+            generated_data.cpu().numpy()
+        
+        return self.preprocessor.inverse_transform(generated_data)
